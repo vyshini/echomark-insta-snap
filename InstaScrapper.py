@@ -722,54 +722,7 @@ if __name__ == "__main__":
     try:
         data = investigate(username, deep=deep, use_cache=use_cache)
         path = save_result(data)
-
-        # ===== PROFILE =====
-        print("\n===== PROFILE =====")
-        print(f"  Username      : {data.get('username')}")
-        print(f"  Full name     : {data.get('full_name') or '(not set)'}")
-        print(f"  Bio           : {data.get('bio') or '(empty)'}")
-        print(f"  Followers     : {data.get('follower_count', 0):,}")
-        print(f"  Following     : {data.get('following_count', 0):,}")
-        print(f"  Posts         : {data.get('post_count', 0):,}")
-        print(f"  Private       : {data.get('is_private')}")
-        print(f"  Verified      : {data.get('is_verified')}")
-
-        # ===== ACCOUNT DETAILS =====
-        ad = data.get("account_details", {})
-        if ad:
-            print(f"\n===== ACCOUNT DETAILS =====")
-            print(f"  Joined          : {ad.get('joined_date') or '(not public)'}")
-            print(f"  Country         : {ad.get('country') or '(not public)'}")
-            print(f"  Former usernames: {ad.get('former_usernames_count') or '(not public)'}")
-
-        # ===== COLLECTED DATA =====
-        print(f"\n===== COLLECTED DATA =====")
-        print(f"  Captions fetched    : {len(data.get('captions', []))}")
-        print(f"  Followers fetched   : {len(data.get('followers', []))}")
-        print(f"  Following fetched   : {len(data.get('following', []))}")
-        print(f"  Posts/Reels fetched : {len(data.get('media_urls', []))}")
-
-        # ===== POSTS & REELS =====
-        media_urls = data.get("media_urls", [])
-        if media_urls:
-            print(f"\n===== POSTS & REELS =====")
-            for m in media_urls:
-                print(f"  {m.get('posted_at')} → {m.get('post_url')}")
-                if m.get("caption"):
-                    print(f"    Caption: {m['caption'][:60]}{'...' if len(m['caption']) > 60 else ''}")
-
-        # ===== FAKE ACCOUNT ANALYSIS =====
-        fa = data.get("fake_account_analysis", {})
-        if fa:
-            print(f"\n===== FAKE ACCOUNT ANALYSIS =====")
-            print(f"  Score   : {fa.get('fake_score_percent')}%")
-            print(f"  Verdict : {fa.get('verdict')}")
-            if fa.get("reasons"):
-                print(f"  Signals :")
-                for r in fa["reasons"]:
-                    print(f"    • {r}")
-
-        print(f"\n[+] Full results saved to: {path}")
+        print(f"[+] Saved to: {path}")
 
     except requests.exceptions.HTTPError as e:
         print(f"[-] API error: {e}")
