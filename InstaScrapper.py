@@ -13,7 +13,7 @@ from datetime import datetime
 # ---------- Setup ----------
 load_dotenv()
 API_KEY = os.environ.get("HIKERAPI_KEY")
-RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+RAPIDAPI_KEY = os.environ.get("FLASHAPI_KEY")
 BASE_URL = "https://api.hikerapi.com"
 
 HIKER_HEADERS = {"x-access-key": API_KEY, "accept": "application/json"}
