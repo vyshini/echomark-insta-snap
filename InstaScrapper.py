@@ -19,7 +19,7 @@ BASE_URL = "https://api.hikerapi.com"
 HIKER_HEADERS = {"x-access-key": API_KEY, "accept": "application/json"}
 RAPIDAPI_HEADERS = {
     "x-rapidapi-key": RAPIDAPI_KEY,
-    "x-rapidapi-host": "instagram120.p.rapidapi.com",
+    "x-rapidapi-host": "flashapi1.p.rapidapi.com",
     "Content-Type": "application/json"
 }
 
@@ -72,6 +72,7 @@ def get_mutual_accounts(user_id):
         params={"id_user": user_id},
         headers=RAPIDAPI_HEADERS
     )
+    
     r.raise_for_status()
     return r.json()
 
@@ -80,6 +81,53 @@ def get_medias(user_id):
                       params={"user_id": user_id}, headers=HIKER_HEADERS)
     r.raise_for_status()
     return r.json()
+
+def get_media_by_code(code):
+    """
+    Fetch post/reel info by shortcode from HikerAPI.
+    Returns the post owner's username and user_id.
+    """
+    r = requests.get(
+        f"{BASE_URL}/v1/media/by/code",
+        params={"code": code},
+        headers=HIKER_HEADERS
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def extract_shortcode(url):
+    """
+    Extract shortcode from Instagram post or reel URL.
+    https://www.instagram.com/p/DZZ8lRptve1/  → DZZ8lRptve1
+    https://www.instagram.com/reel/DZZ8lRptve1/ → DZZ8lRptve1
+    """
+    import re
+    match = re.search(r"instagram\.com/(?:p|reel)/([A-Za-z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def get_username_from_url(url):
+    """
+    Given an Instagram post/reel URL, return the owner's username.
+    """
+    code = extract_shortcode(url)
+    if not code:
+        raise ValueError(f"Could not extract shortcode from URL: {url}")
+
+    print(f"[+] Extracted shortcode: {code}")
+    media = get_media_by_code(code)
+
+    # extract username from media response
+    user = media.get("user", {})
+    username = user.get("username", "")
+    if not username:
+        raise ValueError("Could not find username in media response")
+
+    print(f"[+] Post owner: {username}")
+    return username
 
 
 def get_user_about(user_id):
@@ -628,15 +676,19 @@ def investigate(username, deep=True, use_cache=True):
         try:
             print("[+] Fetching similar accounts...")
             similar_raw = get_mutual_accounts(user_id)
-            # extract only usernames, no duplicates
+
+            users = similar_raw.get("users", []) if isinstance(similar_raw, dict) else similar_raw
+
             result["similar_accounts"] = list(dict.fromkeys(
                 item.get("username", "")
-                for item in similar_raw
-                if item.get("username")
+                for item in users
+                if isinstance(item, dict) and item.get("username")
             ))
+            
             print(f"[+] mutual accounts fetched: {len(result['similar_accounts'])}")
         except requests.exceptions.HTTPError as e:
             print(f"[!] Could not fetch mutual accounts: {e}")
+            print(f"[!] Response body: {e.response.text}")
     elif deep:
         try:
             print("[+] Fetching posts...")
@@ -712,7 +764,21 @@ def save_result(result, folder="data"):
 
 # ---------- Entry point ----------
 if __name__ == "__main__":
-    username = input("Enter target Instagram username: ").strip()
+    print("Select input type:")
+    print("  1 — Instagram username")
+    print("  2 — Instagram post/reel URL")
+    mode = input("Choose (1/2): ").strip()
+
+    if mode == "2":
+        url = input("Enter Instagram post/reel URL: ").strip()
+        try:
+            username = get_username_from_url(url)
+        except Exception as e:
+            print(f"[-] Could not resolve URL: {e}")
+            raise SystemExit(1)
+    else:
+        username = input("Enter target Instagram username: ").strip()
+
     deep_input = input("Full investigation (followers/following/posts)? (y/n): ").strip().lower()
     fresh_input = input("Force fresh data (ignore cache)? (y/n): ").strip().lower()
 
