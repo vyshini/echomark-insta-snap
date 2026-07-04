@@ -1,16 +1,13 @@
-"""
-EchoMark - Instagram OSINT Tool
-Fetches and cross-verifies profile data from HikerAPI + Instagram120 (RapidAPI).
-"""
-
 import os
 import re
+import sys
 import json
 import requests
+from collections import Counter, defaultdict
 from dotenv import load_dotenv
 from datetime import datetime
 
-# ---------- Setup ----------
+
 load_dotenv()
 API_KEY = os.environ.get("HIKERAPI_KEY")
 RAPIDAPI_KEY = os.environ.get("FLASHAPI_KEY")
@@ -23,8 +20,14 @@ RAPIDAPI_HEADERS = {
     "Content-Type": "application/json"
 }
 
+EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+URL_RE = re.compile(r'https?://[^\s]+|(?<![\w@])www\.[^\s]+')
+MENTION_RE = re.compile(r'(?<!\w)@([A-Za-z0-9_.]+)')
+PHONE_RE = re.compile(r'(\+?\d{1,3}[-.\s]?)?\(?\d{3,5}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}')
+HASHTAG_RE = re.compile(r'#([A-Za-z0-9_]+)')
 
-# ---------- HikerAPI functions ----------
+
+# ---------- HikerAPI: profile / graph ----------
 def get_profile(username):
     r = requests.get(f"{BASE_URL}/v1/user/by/username",
                       params={"username": username}, headers=HIKER_HEADERS)
@@ -63,18 +66,14 @@ def get_following(user_id, max_pages=5):
 
 
 def get_mutual_accounts(user_id):
-    """
-    Fetch similar/mutual accounts from Flash API.
-    Used for private accounts where followers/following are inaccessible.
-    """
     r = requests.get(
         "https://flashapi1.p.rapidapi.com/ig/similar_accounts/",
         params={"id_user": user_id},
         headers=RAPIDAPI_HEADERS
     )
-    
     r.raise_for_status()
     return r.json()
+
 
 def get_medias(user_id):
     r = requests.get(f"{BASE_URL}/v1/user/medias",
@@ -82,119 +81,168 @@ def get_medias(user_id):
     r.raise_for_status()
     return r.json()
 
-def get_media_by_code(code):
-    """
-    Fetch post/reel info by shortcode from HikerAPI.
-    Returns the post owner's username and user_id.
-    """
-    r = requests.get(
-        f"{BASE_URL}/v1/media/by/code",
-        params={"code": code},
-        headers=HIKER_HEADERS
-    )
-    r.raise_for_status()
-    return r.json()
-
-
-def extract_shortcode(url):
-    """
-    Extract shortcode from Instagram post or reel URL.
-    https://www.instagram.com/p/DZZ8lRptve1/  → DZZ8lRptve1
-    https://www.instagram.com/reel/DZZ8lRptve1/ → DZZ8lRptve1
-    """
-    import re
-    match = re.search(r"instagram\.com/(?:p|reel)/([A-Za-z0-9_-]+)", url)
-    if match:
-        return match.group(1)
-    return None
-
-
-def get_username_from_url(url):
-    """
-    Given an Instagram post/reel URL, return the owner's username.
-    """
-    code = extract_shortcode(url)
-    if not code:
-        raise ValueError(f"Could not extract shortcode from URL: {url}")
-
-    print(f"[+] Extracted shortcode: {code}")
-    media = get_media_by_code(code)
-
-    # extract username from media response
-    user = media.get("user", {})
-    username = user.get("username", "")
-    if not username:
-        raise ValueError("Could not find username in media response")
-
-    print(f"[+] Post owner: {username}")
-    return username
-
 
 def get_user_about(user_id):
-    """
-    Fetch account creation date, country, and former usernames
-    from HikerAPI GQL endpoint.
-    """
-    r = requests.get(
-        f"{BASE_URL}/gql/user/about",
-        params={"id": user_id},
-        headers=HIKER_HEADERS
-    )
+    r = requests.get(f"{BASE_URL}/gql/user/about",
+                      params={"id": user_id}, headers=HIKER_HEADERS)
     r.raise_for_status()
     return r.json()
 
 
-def parse_flash_media(items):
+# ---------- HikerAPI: comments ----------
+def get_media_comments(media_pk, max_pages=2):
+    comments, max_id, page = [], None, 0
+    while page < max_pages:
+        params = {"id": media_pk}
+        if max_id:
+            params["max_id"] = max_id
+        r = requests.get(f"{BASE_URL}/v1/media/comments/chunk",
+                          params=params, headers=HIKER_HEADERS)
+        r.raise_for_status()
+        data = r.json()
+
+        if isinstance(data, list) and len(data) >= 2:
+            batch, max_id = data[0], data[1]
+        else:
+            batch, max_id = data, None
+
+        comments.extend(batch)
+        page += 1
+        if not max_id or not batch:
+            break
+
+    return comments
+
+
+def analyze_commenters(medias, posts_to_sample=10, max_pages_per_post=2, top_n=5):
     """
-    Extract post URL, thumbnail, video URL (if reel), posted time and caption.
+    Fetches comments from up to `posts_to_sample` posts, dedupes posts and
+    comments, and returns only the top `top_n` commenters with their
+    unique comment text.
     """
-    results = []
+    # dedupe medias by code first — duplicate post entries cause double counting
     seen_codes = set()
+    unique_medias = []
+    for m in medias:
+        code = m.get("code")
+        if code and code not in seen_codes:
+            seen_codes.add(code)
+            unique_medias.append(m)
 
-    for item in items:
-        media = item.get("media", {})
-        code = media.get("code", "")
+    sampled = [m for m in unique_medias if m.get("comment_count", 0) > 0][:posts_to_sample]
 
-        if not code or code in seen_codes:
+    overall_counter = Counter()
+    post_coverage = defaultdict(set)
+    user_comments = defaultdict(list)
+    seen_comment_keys = set()
+
+    for m in sampled:
+        media_pk = m.get("pk")
+        code = m.get("code", "unknown")
+        if not media_pk:
             continue
-        seen_codes.add(code)
 
-        is_reel = media.get("product_type", "") == "clips"
-        taken_at_ts = media.get("taken_at", 0)
+        try:
+            comments = get_media_comments(media_pk, max_pages=max_pages_per_post)
+        except requests.exceptions.HTTPError:
+            continue
 
-        # thumbnail
-        thumbnail_url = ""
-        candidates = media.get("image_versions2", {}).get("candidates", [])
-        if candidates:
-            thumbnail_url = candidates[0].get("url", "")
+        for c in comments:
+            user = c.get("user", {}) or {}
+            uname = user.get("username")
+            text = c.get("text", "")
+            created_at = c.get("created_at_utc", "")
+            comment_pk = c.get("pk", "")
 
-        # video URL — only exists for reels
-        video_url = ""
-        if is_reel:
-            video_versions = media.get("video_versions", [])
-            if video_versions:
-                video_url = video_versions[0].get("url", "")
+            if not uname:
+                continue
 
-        # caption
-        caption_obj = media.get("caption")
-        caption_text = ""
-        if isinstance(caption_obj, dict):
-            caption_text = caption_obj.get("text", "")
+            dedup_key = comment_pk or f"{uname}|{text}|{created_at}|{code}"
+            if dedup_key in seen_comment_keys:
+                continue
+            seen_comment_keys.add(dedup_key)
 
-        results.append({
-            "post_url": f"https://www.instagram.com/{'reel' if is_reel else 'p'}/{code}/",
-            "thumbnail_url": thumbnail_url,
-            "video_url": video_url,  # empty string for regular posts
-            "posted_at": datetime.fromtimestamp(taken_at_ts).strftime("%d %b %Y, %I:%M %p") if taken_at_ts else "unknown",
-            "caption": caption_text,
-        })
+            overall_counter[uname] += 1
+            post_coverage[uname].add(code)
+            user_comments[uname].append({
+                "post_code": code,
+                "text": text,
+                "created_at": created_at
+            })
 
-    return results
+    top_commenters = {
+        uname: {
+            "comment_count": count,
+            "posts_commented_on": sorted(post_coverage[uname]),
+            "comments": user_comments[uname],
+        }
+        for uname, count in overall_counter.most_common(top_n)
+    }
 
-# ---------- Fake account scoring ----------
+    return {
+        "posts_sampled": len(sampled),
+        "top_commenters": top_commenters,
+        "note": f"Top {top_n} commenters based on {len(sampled)} posts sampled "
+                f"(max {posts_to_sample}), {max_pages_per_post} comment pages each — "
+                f"sampled, not exhaustive. Deduplicated by comment ID."
+    }
+
+# ---------- Bio signal extraction ----------
+def find_external_urls(profile):
+    found = []
+    if profile.get("external_url"):
+        found.append(profile["external_url"])
+    for link in profile.get("bio_links", []) or []:
+        if isinstance(link, dict) and link.get("url"):
+            found.append(link["url"])
+        elif isinstance(link, str):
+            found.append(link)
+    if profile.get("external_lynx_url"):
+        found.append(profile["external_lynx_url"])
+    return list(dict.fromkeys(found))
+
+
+def extract_bio_signals(profile):
+    bio = profile.get("biography", "") or ""
+    external_links = find_external_urls(profile)
+
+    emails_seen = {}
+    for e in EMAIL_RE.findall(bio):
+        key = e.lower()
+        if key not in emails_seen:
+            emails_seen[key] = e
+    for key_field in ("public_email", "business_email", "email"):
+        val = profile.get(key_field)
+        if val:
+            key = val.lower()
+            if key not in emails_seen:
+                emails_seen[key] = val
+
+    phones = [p for p in PHONE_RE.findall(bio) if len(re.sub(r'\D', '', p)) >= 7]
+    urls_in_bio = URL_RE.findall(bio)
+    mentions_in_bio = list(set(MENTION_RE.findall(bio)))
+    all_links = list(dict.fromkeys(external_links + urls_in_bio))
+
+    return {
+        "emails": list(emails_seen.values()),
+        "phones": phones,
+        "external_links": all_links,
+        "bio_mentions": mentions_in_bio,
+    }
+
+
+def analyze_caption_signals(captions):
+    all_mentions, all_hashtags = [], []
+    for cap in captions:
+        all_mentions.extend(MENTION_RE.findall(cap))
+        all_hashtags.extend(HASHTAG_RE.findall(cap))
+    return {
+        "mention_frequency": dict(Counter(all_mentions).most_common(20)),
+        "hashtag_frequency": dict(Counter(all_hashtags).most_common(20)),
+    }
+
 def analyze_username_pattern(username):
-    reasons = []
-    score = 0
+    reasons, score = [], 0
     num_count = sum(c.isdigit() for c in username)
     if num_count >= 4:
         score += 1
@@ -212,8 +260,7 @@ def analyze_username_pattern(username):
 
 
 def analyze_captions(captions):
-    reasons = []
-    score = 0
+    reasons, score = [], 0
     if not captions:
         return score, reasons
     for cap in captions:
@@ -230,168 +277,21 @@ def analyze_captions(captions):
     return score, reasons
 
 
-def analyze_follower_quality(followers, following,total_followers = 0):
-    """
-    Deep analysis of follower and following lists.
-    Returns score and detailed reasons.
-    """
-    reasons = []
-    score = 0
-
-    if not followers and not following:
-        return score, reasons
-
-    # ---- Follower analysis ----
-    if followers:
-        total = len(followers)
-        no_pic = 0
-        generated_username = 0
-        private_count = 0
-        verified_count = 0
-
-        for f in followers:
-            username = f.get("username", "")
-            has_pic = f.get("profile_pic_url") not in [None, ""]
-            is_private = f.get("is_private", False)
-            is_verified = f.get("is_verified", False)
-
-            # no profile picture
-            if not has_pic:
-                no_pic += 1
-
-            # auto-generated username pattern
-            num_count = sum(c.isdigit() for c in username)
-            if num_count >= 4:
-                generated_username += 1
-
-            if is_private:
-                private_count += 1
-
-            if is_verified:
-                verified_count += 1
-
-        no_pic_ratio = no_pic / total
-        generated_ratio = generated_username / total
-        private_ratio = private_count / total
-        verified_ratio = verified_count / total
-
-        if no_pic_ratio > 0.5:
-            score += 2
-            reasons.append(
-                f"{int(no_pic_ratio*100)}% of followers have no profile picture (bot signal)"
-            )
-        elif no_pic_ratio > 0.3:
-            score += 1
-            reasons.append(
-                f"{int(no_pic_ratio*100)}% of followers have no profile picture"
-            )
-
-        if generated_ratio > 0.4:
-            score += 2
-            reasons.append(
-                f"{int(generated_ratio*100)}% of followers have auto-generated usernames"
-            )
-        elif generated_ratio > 0.2:
-            score += 1
-            reasons.append(
-                f"{int(generated_ratio*100)}% of followers have suspicious usernames"
-            )
-
-        if private_ratio > 0.8:
-            score += 1
-            reasons.append(
-                f"{int(private_ratio*100)}% of followers are private accounts (unusual)"
-            )
-
-        if verified_ratio > 0.1:
-            score -= 1  # reduce score — having verified followers = credible
-            reasons.append(
-                f"{int(verified_ratio*100)}% of followers are verified accounts (credibility signal)"
-            )
-
-    # ---- Following analysis ----
-    if following:
-        total_following = len(following)
-        generated_following = 0
-
-        for f in following:
-            username = f.get("username", "")
-            num_count = sum(c.isdigit() for c in username)
-            if num_count >= 4:
-                generated_following += 1
-
-        gen_following_ratio = generated_following / total_following
-        if gen_following_ratio > 0.4:
-            score += 1.5
-            reasons.append(
-                f"{int(gen_following_ratio*100)}% of following accounts have bot-like usernames"
-            )
-
-    # ---- Follower/following overlap (mutual follow farm detection) ----
-    if followers and following:
-        follower_ids = set(f.get("pk", f.get("id", "")) for f in followers)
-        following_ids = set(f.get("pk", f.get("id", "")) for f in following)
-        overlap = follower_ids & following_ids
-        overlap_ratio = len(overlap) / max(len(follower_ids), 1)
-
-        if overlap_ratio > 0.7:
-            score += 2
-            reasons.append(
-                f"{int(overlap_ratio*100)}% overlap between followers and following "
-                f"({len(overlap)} accounts) — possible mutual follow farm"
-            )
-        elif overlap_ratio > 0.4:
-            score += 1
-            reasons.append(
-                f"{int(overlap_ratio*100)}% overlap between followers and following"
-            )
-    confidence = get_sample_confidence(len(followers), total_followers)
-    score = score * confidence
-
-    if confidence < 0.5:
-        reasons.append(
-            f"Note: follower analysis based on {len(followers)} sampled "
-            f"out of {total_followers} total — low sample confidence"
-        )
-
-
-    return score, reasons
-
-def get_sample_confidence(sampled, total):
-    """How much to trust signals based on sample size."""
-    if total == 0:
-        return 0
-    ratio = sampled / total
-    if ratio >= 0.5:
-        return 1.0    # high confidence
-    elif ratio >= 0.2:
-        return 0.7    # medium confidence
-    elif ratio >= 0.05:
-        return 0.4    # low confidence
-    else:
-        return 0.2    # very low confidence — flag it
-
-
 def analyze_caption_quality(captions):
-    score = 0
-    reasons = []
-
+    score, reasons = 0, []
     if not captions:
         return score, reasons
 
-    # average caption length
     avg_len = sum(len(c) for c in captions) / len(captions)
     if avg_len < 5:
         score += 1
         reasons.append("Captions are extremely short on average")
 
-    # all caps posting (shouting/spam behavior)
     all_caps = sum(1 for c in captions if c.upper() == c and len(c) > 5)
     if all_caps / len(captions) > 0.5:
         score += 1
         reasons.append(f"{int(all_caps/len(captions)*100)}% of captions are all-caps")
 
-    # excessive emoji usage (no real text)
     import unicodedata
     def is_emoji(char):
         return unicodedata.category(char) in ('So', 'Sm')
@@ -402,47 +302,38 @@ def analyze_caption_quality(captions):
         if total_chars == 0:
             continue
         emoji_chars = sum(1 for c in cap if is_emoji(c))
-        if total_chars > 0 and emoji_chars / total_chars > 0.5:
+        if emoji_chars / total_chars > 0.5:
             emoji_heavy += 1
-
     if len(captions) > 0 and emoji_heavy / len(captions) > 0.5:
         score += 0.5
         reasons.append("Most captions are emoji-only (no real text content)")
 
-    # keyword spam detection
     spam_keywords = ["follow", "followback", "follow4follow", "f4f",
                       "like4like", "l4l", "dm for promo", "link in bio",
                       "giveaway", "win free"]
-    spam_hits = 0
-    for cap in captions:
-        if any(kw in cap.lower() for kw in spam_keywords):
-            spam_hits += 1
-
+    spam_hits = sum(1 for cap in captions if any(kw in cap.lower() for kw in spam_keywords))
     if spam_hits > 0:
         score += spam_hits * 0.5
         reasons.append(f"{spam_hits} captions contain spam/promotional keywords")
 
     return score, reasons
 
-def analyze_posting_hours(medias):
-    score = 0
-    reasons = []
 
+def analyze_posting_hours(medias):
+    score, reasons = 0, []
     hours = []
     for m in medias:
         taken_at = m.get("taken_at", "")
         if taken_at:
             try:
-                from datetime import datetime
                 dt = datetime.fromisoformat(taken_at.replace("Z", "+00:00"))
                 hours.append(dt.hour)
-            except:
+            except Exception:
                 pass
 
     if len(hours) < 3:
         return score, reasons
 
-    # all posts at same hour — robotic scheduling
     unique_hours = set(hours)
     if len(unique_hours) == 1:
         score += 1.5
@@ -451,13 +342,28 @@ def analyze_posting_hours(medias):
         score += 1
         reasons.append("Posts clustered in very narrow time window")
 
-    # posting only at 3-5am (bot hours)
     suspicious_hours = sum(1 for h in hours if 2 <= h <= 5)
     if suspicious_hours / len(hours) > 0.7:
         score += 1
         reasons.append("Majority of posts published between 2-5am (bot-typical hours)")
 
     return score, reasons
+
+
+def get_sample_confidence(sampled, total):
+    if total == 0:
+        return 0
+    ratio = sampled / total
+    if ratio >= 0.5:
+        return 1.0
+    elif ratio >= 0.2:
+        return 0.7
+    elif ratio >= 0.05:
+        return 0.4
+    else:
+        return 0.2
+
+
 def fake_account_score(profile, medias=None, followers=None, following=None, captions=None):
     total_score = 0
     all_reasons = []
@@ -472,7 +378,6 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
     post_count = profile.get("post_count", profile.get("media_count", 0))
     username = profile.get("username", "")
 
-    # --- Basic profile signals ---
     if post_count == 0:
         total_score += 1.5
         all_reasons.append("Account has zero posts")
@@ -486,7 +391,6 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
         total_score += 1
         all_reasons.append("No profile picture set")
 
-    # --- Follower/following ratio ---
     if followers_count > 0:
         ratio = following_count / max(followers_count, 1)
         if ratio > 10:
@@ -499,7 +403,6 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
         total_score += 2
         all_reasons.append("Following many accounts with zero followers")
 
-    # --- Engagement rate (from raw medias if available) ---
     if medias and followers_count > 1000:
         avg_likes = sum(m.get("like_count", 0) for m in medias) / len(medias)
         eng_rate = avg_likes / followers_count
@@ -510,13 +413,10 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
             total_score += 1
             all_reasons.append(f"Low engagement rate ({eng_rate*100:.2f}%)")
 
-    # --- Username pattern ---
     u_score, u_reasons = analyze_username_pattern(username)
     total_score += u_score
     all_reasons.extend(u_reasons)
 
-    # --- Caption analysis ---
-    # use passed captions if available, otherwise extract from raw medias
     if not captions and medias:
         captions = [m.get("caption_text", "") for m in medias if m.get("caption_text")]
 
@@ -528,72 +428,50 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
     total_score += cq_score
     all_reasons.extend(cq_reasons)
 
-    # --- Posting hours ---
     ph_score, ph_reasons = analyze_posting_hours(medias)
     total_score += ph_score
     all_reasons.extend(ph_reasons)
 
-    # --- Follower/following quality ---
-    # followers/following are now username strings — updated logic
     if followers or following:
-        # bot-like username detection on follower names
         if followers:
-            bot_like = sum(
-                1 for uname in followers
-                if isinstance(uname, str) and sum(c.isdigit() for c in uname) >= 4
-            )
+            bot_like = sum(1 for uname in followers
+                            if isinstance(uname, str) and sum(c.isdigit() for c in uname) >= 4)
             ratio = bot_like / len(followers)
             if ratio > 0.4:
                 total_score += 2
-                all_reasons.append(
-                    f"{int(ratio*100)}% of sampled followers have bot-like usernames"
-                )
+                all_reasons.append(f"{int(ratio*100)}% of sampled followers have bot-like usernames")
             elif ratio > 0.2:
                 total_score += 1
-                all_reasons.append(
-                    f"{int(ratio*100)}% of sampled followers have suspicious usernames"
-                )
+                all_reasons.append(f"{int(ratio*100)}% of sampled followers have suspicious usernames")
 
-        # bot-like username detection on following names
         if following:
-            bot_following = sum(
-                1 for uname in following
-                if isinstance(uname, str) and sum(c.isdigit() for c in uname) >= 4
-            )
+            bot_following = sum(1 for uname in following
+                                 if isinstance(uname, str) and sum(c.isdigit() for c in uname) >= 4)
             ratio_f = bot_following / len(following)
             if ratio_f > 0.4:
                 total_score += 1.5
-                all_reasons.append(
-                    f"{int(ratio_f*100)}% of following accounts have bot-like usernames"
-                )
+                all_reasons.append(f"{int(ratio_f*100)}% of following accounts have bot-like usernames")
 
-        # overlap detection
         if followers and following:
-            f_set = set(followers)
-            fg_set = set(following)
+            f_set, fg_set = set(followers), set(following)
             overlap = f_set & fg_set
             overlap_ratio = len(overlap) / max(len(f_set), 1)
-            if len(f_set) >= 10:  # only flag if sample is meaningful
+            if len(f_set) >= 10:
                 if overlap_ratio > 0.7:
                     total_score += 2
                     all_reasons.append(
                         f"{int(overlap_ratio*100)}% overlap between followers and following "
-                        f"({len(overlap)} accounts) — possible mutual follow farm"
-                    )
+                        f"({len(overlap)} accounts) — possible mutual follow farm")
                 elif overlap_ratio > 0.4:
                     total_score += 1
-                    all_reasons.append(
-                        f"{int(overlap_ratio*100)}% overlap between followers and following"
-                    )
+                    all_reasons.append(f"{int(overlap_ratio*100)}% overlap between followers and following")
 
-        # sample confidence note
         if followers_count > 0:
             confidence = get_sample_confidence(len(followers), followers_count)
             if confidence < 0.5:
                 all_reasons.append(
                     f"Note: follower analysis based on {len(followers)} sampled "
-                    f"out of {followers_count} total — low confidence"
-                )
+                    f"out of {followers_count} total — low confidence")
 
     max_possible = 18
     normalized = min(max(round((total_score / max_possible) * 100), 0), 100)
@@ -614,21 +492,13 @@ def fake_account_score(profile, medias=None, followers=None, following=None, cap
         "reasons": all_reasons,
     }
 
+
 # ---------- Orchestration ----------
-def investigate(username, deep=True, use_cache=True):
-    cache_path = f"data/{username}.json"
-
-    if use_cache and os.path.exists(cache_path):
-        print(f"[+] Loading cached data for '{username}'...")
-        with open(cache_path) as f:
-            return json.load(f)
-
-    print(f"\n[+] Fetching profile from HikerAPI...")
+def investigate(username, posts_to_sample_for_comments=10, comment_pages_per_post=2):
     hiker_profile = get_profile(username)
     user_id = hiker_profile["pk"]
     is_private = hiker_profile.get("is_private", False)
 
-    # --- build result dict with all keys initialized upfront ---
     result = {
         "username": hiker_profile["username"],
         "user_id": user_id,
@@ -648,54 +518,46 @@ def investigate(username, deep=True, use_cache=True):
             "joined_date": "",
             "former_usernames_count": "",
         },
+        "bio_signals": {},
         "captions": [],
+        "caption_signals": {},
         "media_urls": [],
         "followers": [],
         "following": [],
         "similar_accounts": [],
+        "commenter_analysis": {},
         "fake_account_analysis": None,
     }
 
-    # --- fetch additional info (account creation date etc.) ---
-    print("[+] Fetching additional account info...")
+    result["bio_signals"] = extract_bio_signals(hiker_profile)
+
     try:
         about = get_user_about(user_id)
         result["account_details"] = {
-        "country": about.get("country", ""),
-        "joined_date": about.get("date", ""),
-        "former_usernames_count": about.get("former_usernames", ""),
-        "is_verified": about.get("is_verified", False),
-    }
+            "country": about.get("country", ""),
+            "joined_date": about.get("date", ""),
+            "former_usernames_count": about.get("former_usernames", ""),
+            "is_verified": about.get("is_verified", False),
+        }
     except requests.exceptions.HTTPError as e:
-        print(f"[!] Could not fetch additional info: {e}")
+        print(f"[!] Could not fetch additional info: {e}", file=sys.stderr)
 
     medias = []
 
     if is_private:
-        print("[!] Account is private — only public profile metadata available.")
         try:
-            print("[+] Fetching similar accounts...")
             similar_raw = get_mutual_accounts(user_id)
-
             users = similar_raw.get("users", []) if isinstance(similar_raw, dict) else similar_raw
-
             result["similar_accounts"] = list(dict.fromkeys(
-                item.get("username", "")
-                for item in users
+                item.get("username", "") for item in users
                 if isinstance(item, dict) and item.get("username")
             ))
-            
-            print(f"[+] mutual accounts fetched: {len(result['similar_accounts'])}")
         except requests.exceptions.HTTPError as e:
-            print(f"[!] Could not fetch mutual accounts: {e}")
-            print(f"[!] Response body: {e.response.text}")
-    elif deep:
+            print(f"[!] Could not fetch mutual accounts: {e}", file=sys.stderr)
+    else:
         try:
-            print("[+] Fetching posts...")
             medias = get_medias(user_id)
 
-
-            # save permanent post/reel URLs + metadata
             result["media_urls"] = [
                 {
                     "post_url": f"https://www.instagram.com/{'reel' if m.get('product_type') == 'clips' else 'p'}/{m.get('code', '')}/",
@@ -707,12 +569,12 @@ def investigate(username, deep=True, use_cache=True):
                     ),
                     "video_url": m.get("video_url", ""),
                     "taken_at_ts": m.get("taken_at_ts", 0),
+                    "comment_count": m.get("comment_count", 0),
                     "caption": m.get("caption_text", ""),
                 }
                 for m in medias if m.get("code")
             ]
 
-            # save only caption text (no duplicates)
             seen_captions = set()
             for m in medias:
                 cap = m.get("caption_text", "").strip()
@@ -720,77 +582,65 @@ def investigate(username, deep=True, use_cache=True):
                     seen_captions.add(cap)
                     result["captions"].append(cap)
 
+            result["caption_signals"] = analyze_caption_signals(result["captions"])
+
         except requests.exceptions.HTTPError as e:
-            print(f"[!] Could not fetch posts: {e}")
+            print(f"[!] Could not fetch posts: {e}", file=sys.stderr)
 
         try:
-            print("[+] Fetching followers...")
             raw_followers = get_followers(user_id)
-            # save only usernames, no duplicates
             result["followers"] = list(dict.fromkeys(
-                u.get("username") for u in raw_followers
-                if u.get("username")
+                u.get("username") for u in raw_followers if u.get("username")
             ))
-       
         except requests.exceptions.HTTPError as e:
-            print(f"[!] Could not fetch followers: {e}")
+            print(f"[!] Could not fetch followers: {e}", file=sys.stderr)
 
         try:
-            print("[+] Fetching following...")
             raw_following = get_following(user_id)
-            # save only usernames, no duplicates
             result["following"] = list(dict.fromkeys(
-                u.get("username") for u in raw_following
-                if u.get("username")
+                u.get("username") for u in raw_following if u.get("username")
             ))
         except requests.exceptions.HTTPError as e:
-            print(f"[!] Could not fetch following: {e}")
+            print(f"[!] Could not fetch following: {e}", file=sys.stderr)
 
-    # --- fake account scoring ---
+        if medias:
+            try:
+                result["commenter_analysis"] = analyze_commenters(
+                    medias,
+                    posts_to_sample=10,
+                    max_pages_per_post=2,
+                    top_n=5
+                )
+            except Exception as e:
+                print(f"[!] Could not analyze commenters: {e}", file=sys.stderr)
     result["fake_account_analysis"] = fake_account_score(
         result, medias, result["followers"], result["following"]
     )
 
     return result
 
-
 def save_result(result, folder="data"):
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f"{result['username']}.json")
-    with open(path, "w") as f:
-        json.dump(result, f, indent=2)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
     return path
-
 
 # ---------- Entry point ----------
 if __name__ == "__main__":
-    print("Select input type:")
-    print("  1 — Instagram username")
-    print("  2 — Instagram post/reel URL")
-    mode = input("Choose (1/2): ").strip()
+    if not API_KEY:
+        print("[-] HIKERAPI_KEY not found in environment / .env file", file=sys.stderr)
+        raise SystemExit(1)
 
-    if mode == "2":
-        url = input("Enter Instagram post/reel URL: ").strip()
-        try:
-            username = get_username_from_url(url)
-        except Exception as e:
-            print(f"[-] Could not resolve URL: {e}")
-            raise SystemExit(1)
-    else:
-        username = input("Enter target Instagram username: ").strip()
-
-    deep_input = input("Full investigation (followers/following/posts)? (y/n): ").strip().lower()
-    fresh_input = input("Force fresh data (ignore cache)? (y/n): ").strip().lower()
-
-    deep = deep_input == "y"
-    use_cache = fresh_input != "y"
+    username = input("Enter Instagram username: ").strip()
+    if not username:
+        print("[-] No username entered.", file=sys.stderr)
+        raise SystemExit(1)
 
     try:
-        data = investigate(username, deep=deep, use_cache=use_cache)
-        path = save_result(data)
-        print(f"[+] Saved to: {path}")
-
+        data = investigate(username)
+        save_result(data)
     except requests.exceptions.HTTPError as e:
-        print(f"[-] API error: {e}")
+        print(f"[-] API error: {e}", file=sys.stderr)
     except Exception as e:
-        print(f"[-] Something went wrong: {e}")
+        print(f"[-] Something went wrong: {e}", file=sys.stderr)
